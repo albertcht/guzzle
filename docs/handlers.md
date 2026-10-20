@@ -506,7 +506,7 @@ one multi handler can also abort the process.
 Configure an execution context provider from `guzzlehttp/promises` while
 bootstrapping the process, before creating clients. See the
 [Execution Contexts](https://github.com/guzzle/promises/blob/3.0/docs/execution-contexts.md)
-guide for providers, modes, and finishing contexts.
+guide for providers and finishing contexts.
 
 ```php
 use GuzzleHttp\Promise\ExecutionContext;
@@ -521,21 +521,44 @@ the shared `CurlHandler`, which takes a dedicated easy handle for each request.
 Clients created before the provider was configured are not isolated.
 
 `ContextualCurlMultiHandler`: Sends asynchronous requests through a cURL multi
-handler leased to the current execution context.
+handler leased to the current execution context while it has work.
 
-When an execution context finishes, its unfinished transfers are cancelled and
-its idle handler returns to a bounded pool, so later contexts can reuse its
-connections. Requests made outside managed contexts share one handler.
+Idle handlers return to a bounded pool so other contexts can reuse their
+connections before the original context finishes. Requests made outside managed
+contexts share one handler. The default handler keeps up to 8 idle handlers.
 
-Handlers return to the pool only when their context is finished. With a provider
-that does not register finalizers, such as the fiber provider, call
-`ExecutionContext::finish()` at the end of each context, or every context
-creates a new handler with its own connections. The default handler keeps up to
-8 idle handlers.
+With a pool limit of 0, each context keeps its handler until it finishes, reusing
+connections within that context without pooling it for later ones.
+
+When an execution context finishes, its unfinished transfers are cancelled. With
+a provider that does not register finalizers, such as the fiber provider, call
+`ExecutionContext::finish()` at the end of each context to cancel unfinished
+transfers and drain its task queue.
+
+Set the `max_idle_multi_handlers` client option to retain more handlers for
+recurring bursts of concurrent contexts, or to `0` to keep reuse within each
+context only. This is a non-negative integer; `null` uses the default. It limits
+idle handlers retained for reuse, not active contexts or connections. The same
+option is available in `Utils::chooseHandler()`.
+
+```php
+$client = new GuzzleHttp\Client(['max_idle_multi_handlers' => 32]);
+```
+
+The option applies only to the default asynchronous cURL handler with an
+execution context provider configured. Without a provider it has no effect.
+With a custom handler, configure the pool size through
+`ContextualCurlMultiHandler`'s second constructor argument instead.
 
 Handlers created with the `max_host_connections` or `max_total_connections`
 options are not leased per context, because connection caps apply to one shared
-multi handle. Use such clients from one context at a time.
+multi handle. Use such clients from one context at a time. These options cannot
+be combined with `max_idle_multi_handlers`.
+
+The fiber provider identifies the current fiber; it does not schedule fibers or
+make cURL calls nonblocking. A scheduler must drive each context's transfers
+and task queue in that context. Promises created in a managed context must be
+settled there, including when adapting an external event loop.
 
 With an execution context provider configured, `CurlMultiHandler` rejects use
 from a different execution context while it has active transfers or a call in

@@ -190,6 +190,9 @@ final class CurlMultiHandler
      */
     private $finalizingContexts;
 
+    /** @var (callable(self): void)|null */
+    private $idleCallback;
+
     /**
      * This handler accepts the following options:
      *
@@ -316,13 +319,14 @@ final class CurlMultiHandler
         array $options
     ): PromiseInterface {
         $this->assertOpen();
-        HostValidator::assertRequestHost($request);
 
         // Preparing the request can read the request body, which can suspend
         // the current execution context, so ownership is claimed first.
         $claimed = $this->claimForCurrentContext();
 
         try {
+            HostValidator::assertRequestHost($request);
+
             return $this->createTransfer($request, $options);
         } finally {
             $this->releaseClaim($claimed);
@@ -930,6 +934,17 @@ final class CurlMultiHandler
             return;
         }
 
+        $claimed = $this->claimForCurrentContext();
+
+        try {
+            $this->tickAssignedHandler();
+        } finally {
+            $this->releaseClaim($claimed);
+        }
+    }
+
+    private function tickAssignedHandler(): void
+    {
         if ($this->multiExecDepth > 0) {
             // A cURL callback re-entered the handler while native execution
             // is running; the outer frame drives native cURL once it unwinds.
@@ -1078,6 +1093,14 @@ final class CurlMultiHandler
     }
 
     /**
+     * @internal
+     */
+    public function isClosed(): bool
+    {
+        return $this->closed;
+    }
+
+    /**
      * Determines if the handler has no tracked, delayed, or deferred
      * transfers, no call running for its owner, and no native execution,
      * message processing, or close in progress.
@@ -1098,8 +1121,8 @@ final class CurlMultiHandler
 
     /**
      * Assigns the handler to the running execution context, so ticks queued by
-     * any other context are ignored and the transfers the context leaves are
-     * cancelled when it is finished.
+     * any other context are ignored. The pool must call finishContext() for
+     * transfers the context leaves behind.
      *
      * @internal
      */
@@ -1111,7 +1134,44 @@ final class CurlMultiHandler
             throw new \LogicException('A cURL multi handler can only be assigned inside a managed execution context.');
         }
 
-        $this->claimOwnership($context);
+        $this->owner = \WeakReference::create($context);
+    }
+
+    /**
+     * @internal
+     *
+     * @param callable(self): void $callback
+     */
+    public function onIdle(callable $callback): void
+    {
+        $this->idleCallback = $callback;
+    }
+
+    /**
+     * Cancels transfers still owned by the finished context.
+     *
+     * @internal
+     */
+    public function finishContext(object $context): void
+    {
+        if ($this->owner === null || $this->owner->get() !== $context) {
+            return;
+        }
+
+        // Cancellation can re-enter the handler. Keep its lease until the
+        // entire sweep has finished, including transfers created by callbacks.
+        ++$this->activeCalls;
+
+        try {
+            $this->cancelPendingTransfers();
+        } finally {
+            --$this->activeCalls;
+
+            if ($this->isIdle()) {
+                $this->owner = null;
+                $this->notifyIdle();
+            }
+        }
     }
 
     /**
@@ -1178,30 +1238,39 @@ final class CurlMultiHandler
                 unset($handler->finalizingContexts[$context]);
             }
 
-            // Another context may have taken over the handler after it became
-            // idle, and its transfers are not this context's to cancel.
-            if ($handler->owner === null || $handler->owner->get() !== $context) {
-                return;
-            }
-
-            $handler->cancelPendingTransfers();
-
-            // Release the handler, so that this context claims it again, with
-            // a new finalizer, if it uses the handler after being finished.
-            if ($handler->isIdle()) {
-                $handler->owner = null;
-            }
+            $handler->finishContext($context);
         });
     }
 
     /**
-     * Cancels every transfer the handler is tracking, rejecting their
+     * Cancels every transfer the handler is tracking, rejecting pending
      * promises with a cancellation.
      */
     private function cancelPendingTransfers(): void
     {
-        foreach ($this->handles as $entry) {
-            $entry['deferred']->cancel();
+        $failure = null;
+
+        // Removing a transfer can run callbacks that create another transfer.
+        while ($this->handles !== []) {
+            $remaining = $this->handles;
+
+            foreach ($this->handles as $id => $entry) {
+                $this->captureFailure($failure, function () use ($id, $entry): void {
+                    if (P\Is::pending($entry['deferred'])) {
+                        $entry['deferred']->cancel();
+                    } else {
+                        $this->cancel($id, $entry['wait_token']);
+                    }
+                });
+            }
+
+            if ($this->handles === $remaining) {
+                break;
+            }
+        }
+
+        if ($failure !== null) {
+            throw $failure;
         }
     }
 
@@ -1222,17 +1291,25 @@ final class CurlMultiHandler
     {
         if ($claimed) {
             --$this->activeCalls;
+            $this->notifyIdle();
+        }
+    }
+
+    private function notifyIdle(): void
+    {
+        if ($this->idleCallback !== null && $this->isIdle()) {
+            ($this->idleCallback)($this);
         }
     }
 
     /**
-     * Determines if the handler is unassigned or assigned to the current
-     * execution context.
+     * Determines if the current execution context owns the handler. A handler
+     * without an owner belongs to code running outside managed contexts.
      */
     private function isAssignedToCurrentContext(): bool
     {
         if ($this->owner === null) {
-            return true;
+            return P\ExecutionContext::current() === null;
         }
 
         $owner = $this->owner->get();
